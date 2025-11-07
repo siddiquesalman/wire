@@ -46,12 +46,10 @@ if __name__ == '__main__':
     
     # Read image and scale. A scale of 0.5 for parrot image ensures that it
     # fits in a 12GB GPU
-    im = utils.normalize(plt.imread('data/parrot.png').astype(np.float32), True)
-    im = cv2.resize(im, None, fx=1/2, fy=1/2, interpolation=cv2.INTER_AREA)
-    H, W, _ = im.shape
-    
-    # Create a noisy image
-    im_noisy = utils.measure(im, noise_snr, tau)
+    import scipy.io as sio
+    flow_dict = sio.loadmat('data/flow_mat.mat')
+    H, W,  = 256, 256
+
     
     if nonlin == 'posenc':
         nonlin = 'relu'
@@ -82,24 +80,31 @@ if __name__ == '__main__':
     # Send model to CUDA
     model.cuda()
     
+    coords_sparse = torch.from_numpy(flow_dict['coords_sparse']).float()
+    print(coords_sparse.shape)
+    coords_dense = torch.from_numpy(flow_dict['coords_dense'])
+    sparse_flow_rgb = torch.from_numpy(flow_dict['sparse_flow_rgb']).float().cuda() / 1.
+    flow_rgb = torch.from_numpy(flow_dict['flow_rgb']).float()
+    vasc_bin = flow_dict['vasc_bin']
     print('Number of parameters: ', utils.count_parameters(model))
-    print('Input PSNR: %.2f dB'%utils.psnr(im, im_noisy))
-    
+
     # Create an optimizer
-    optim = torch.optim.Adam(lr=learning_rate*min(1, maxpoints/(H*W)),
+    optim = torch.optim.Adam(lr=learning_rate*min(1, maxpoints/(coords_sparse.shape[1])),
                              params=model.parameters())
     
     # Schedule to reduce lr to 0.1 times the initial rate in final epoch
     scheduler = LambdaLR(optim, lambda x: 0.1**min(x/niters, 1))
     
-    x = torch.linspace(-1, 1, W)
-    y = torch.linspace(-1, 1, H)
+    # x = torch.linspace(-1, 1, W)
+    # y = torch.linspace(-1, 1, H)
     
-    X, Y = torch.meshgrid(x, y, indexing='xy')
-    coords = torch.hstack((X.reshape(-1, 1), Y.reshape(-1, 1)))[None, ...]#;print(coords.shape,'coords')
-    # import pdb;pdb.set_trace()
-    gt = torch.tensor(im).cuda().reshape(H*W, 3)[None, ...]
-    gt_noisy = torch.tensor(im_noisy).cuda().reshape(H*W, 3)[None, ...]
+    # X, Y = torch.meshgrid(x, y, indexing='xy')
+    # coords = torch.hstack((X.reshape(-1, 1), Y.reshape(-1, 1)))[None, ...]
+    
+
+
+    
+    
     
     mse_array = torch.zeros(niters, device='cuda')
     mse_loss_array = torch.zeros(niters, device='cuda')
@@ -108,23 +113,23 @@ if __name__ == '__main__':
     best_mse = torch.tensor(float('inf'))
     best_img = None
     
-    rec = torch.zeros_like(gt)
+    
     
     tbar = tqdm(range(niters))
     init_time = time.time()
     for epoch in tbar:
-        indices = torch.randperm(H*W)#;print(indices.shape,'indices')
+        indices = torch.randperm(coords_sparse.shape[1])
         
-        for b_idx in range(0, H*W, maxpoints):
-            b_indices = indices[b_idx:min(H*W, b_idx+maxpoints)]
-            b_coords = coords[:, b_indices, ...].cuda()
+        for b_idx in range(0, coords_sparse.shape[1], maxpoints):
+            b_indices = indices[b_idx:min(coords_sparse.shape[1], b_idx+maxpoints)]
+            b_coords = coords_sparse[:, b_indices, ...].cuda()
             b_indices = b_indices.cuda()
-            pixelvalues = model(b_coords);print(pixelvalues.shape)
+            pixelvalues = model(b_coords)
             
-            with torch.no_grad():
-                rec[:, b_indices, :] = pixelvalues
+            # with torch.no_grad():
+            #     rec[:, b_indices, :] = pixelvalues
     
-            loss = ((pixelvalues - gt_noisy[:, b_indices, :])**2).mean() 
+            loss = ((pixelvalues - sparse_flow_rgb[:, b_indices, :])**2).mean() 
             
             optim.zero_grad()
             loss.backward()
@@ -133,37 +138,42 @@ if __name__ == '__main__':
         time_array[epoch] = time.time() - init_time
         
         with torch.no_grad():
-            mse_loss_array[epoch] = ((gt_noisy - rec)**2).mean().item()
-            mse_array[epoch] = ((gt - rec)**2).mean().item()
-            im_gt = gt.reshape(H, W, 3).permute(2, 0, 1)[None, ...]
-            im_rec = rec.reshape(H, W, 3).permute(2, 0, 1)[None, ...]
+            flow_pred = 255.*np.ones((256,256,3))
+            indices = torch.linspace(0,coords_dense.shape[1]-1,coords_dense.shape[1]).int()
+            preds = []
+            for b_idx in range(0, coords_dense.shape[1], maxpoints):
+                b_indices = indices[b_idx:min(coords_dense.shape[1], b_idx+maxpoints)]
+                b_coords = coords_dense[:, b_indices, ...].cuda()
+                b_indices = b_indices.cuda()
+                pixelvalues = model(b_coords)
+                preds.append(pixelvalues)
+            predicted_flow = torch.cat(preds,1)
+            flow_pred[vasc_bin > 0] = predicted_flow[0,::].detach().cpu().numpy()
+
         
-            psnrval = -10*torch.log10(mse_array[epoch])
-            tbar.set_description('%.1f'%psnrval)
+        
             tbar.refresh()
         
         scheduler.step()
         
-        imrec = rec[0, ...].reshape(H, W, 3).detach().cpu().numpy()
+        
             
-        cv2.imshow('Reconstruction', imrec[..., ::-1])            
+        cv2.imshow('Reconstruction', (1.*flow_pred).astype(np.uint8)[..., ::-1])            
         cv2.waitKey(1)
     
         if (mse_array[epoch] < best_mse) or (epoch == 0):
             best_mse = mse_array[epoch]
-            best_img = imrec
+            best_img = flow_pred
     
     if posencode:
         nonlin = 'posenc'
         
     mdict = {'rec': best_img,
-             'gt': im,
-             'im_noisy': im_noisy,
              'mse_noisy_array': mse_loss_array.detach().cpu().numpy(), 
              'mse_array': mse_array.detach().cpu().numpy(),
              'time_array': time_array.detach().cpu().numpy()}
     
     os.makedirs('results/denoising', exist_ok=True)
     io.savemat('results/denoising/%s.mat'%nonlin, mdict)
-
-    print('Best PSNR: %.2f dB'%utils.psnr(im, best_img))
+    import skimage
+    skimage.io.imsave('best_flow.png',(1.*flow_pred).astype(np.uint8))
